@@ -188,6 +188,9 @@ module Resque
       end
 
       nil
+    rescue Resque::Helpers::DecodeException => e
+      log "Error decoding job: #{e.inspect}"
+      retry
     rescue Exception => e
       log "Error reserving job: #{e.inspect}"
       log e.backtrace.join("\n")
