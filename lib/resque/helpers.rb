@@ -29,7 +29,7 @@ module Resque
       begin
         ::MultiJson.decode(object)
       rescue ::MultiJson::DecodeError => e
-        raise DecodeException, e
+        raise DecodeException, "Can't decode #{object.inspect}"
       end
     end
 
