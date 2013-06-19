@@ -10,6 +10,9 @@ module Resque
     include Resque::Helpers
     extend Resque::Helpers
 
+    attr_accessor :master
+    attr_accessor :queues
+
     # Whether the worker should log basic info to STDOUT
     attr_accessor :verbose
 
@@ -57,7 +60,7 @@ module Resque
     def self.find(worker_id)
       if exists? worker_id
         queues = worker_id.split(':')[-1].split(',')
-        worker = new(nil, :queues => queues)
+        worker = new(:queues => queues)
         worker.to_s = worker_id
         worker
       else
@@ -87,13 +90,15 @@ module Resque
     # If passed a single "*", this Worker will operate on all queues
     # in alphabetical order. Queues can be dynamically added or
     # removed without needing to restart workers using this method.
-    def initialize(master, options={})
-      @master = master
+    def initialize(options={})
       @options = options
 
+      @master = @options[:master]
       @queues = @options[:queues].map { |queue| queue.to_s.strip }
-      @interval = @options[:interval]
+
+      @interval = @options[:interval] || 5
       @maximum_task_time = @options[:maximum_task_time]
+      @wait_sleep = @options[:wait_sleep] || 0.1
 
       validate_queues
     end
@@ -128,7 +133,11 @@ module Resque
       update_status "resque: Starting"
       startup
 
-      while !@master || @master.wants_me_alive?
+      # The pattern of "either no master or #wants_me_alive?" is used to
+      # support the transitional case in which we want to preserve the
+      # behavior of resque without a process supervisor.
+
+      while !master || master.wants_me_alive?
 
         if (job = reserve)
           log "got: #{job.inspect}"
@@ -136,7 +145,9 @@ module Resque
           working_on job
 
           start_time = Time.now
-          limit = start_time + @maximum_task_time
+          limit = start_time + @maximum_task_time if @maximum_task_time
+
+          # Fork the child process!
 
           @child = Kernel.fork do
             srand # Reseeding
@@ -148,19 +159,34 @@ module Resque
           srand # Reseeding
           procline "Forked #{@child} at #{Time.now.to_i}"
 
+          # Wait until the child dies!
+
           begin
+            still_running = true
             loop do
+              # Check in with the master process during each iteration
+              still_running &= (!master || master.wants_me_alive?)
+
+              # If we receive a notifcation that one of our children has died,
+              # then our work is done (for better or for worse).
               pid = Process.wait(-1, Process::WNOHANG)
               break if pid
-              if Time.now > limit
-                @master.logger.info "killed job (ran for #{Time.now - start_time}s)"
+
+              # If the client specified a maximum time limit for the child
+              # process, then enforce it here by sending a kill signal.
+              if limit && Time.now > limit
+                log_always "killed job (ran for #{Time.now - start_time}s)"
                 Process.kill(:KILL, @child)
                 break
               end
-              sleep 0.1
+
+              sleep @wait_sleep
             end
           rescue Errno::EINTR
             retry
+          # These can be throw by Process.wait and Process.kill, they indicate
+          # to us that our child is no longer running (or died before the
+          # control loop started).
           rescue Errno::ECHILD, Errno::ESRCH
           end
 
@@ -452,13 +478,17 @@ module Resque
       update_status "resque-#{Resque::Version}: #{string}"
     end
 
+    def log_always(message)
+      to_output "*** #{message}"
+    end
+
     # Log a message to STDOUT if we are verbose or very_verbose.
     def log(message)
       if verbose
-        @master.logger.info "*** #{message}"
+        to_output "*** #{message}"
       elsif very_verbose
         time = Time.now.strftime('%H:%M:%S %Y-%m-%d')
-        @master.logger.info "** [#{time}] #$$: #{message}"
+        to_output "** [#{time}] #$$: #{message}"
       end
     end
 
@@ -467,8 +497,12 @@ module Resque
       log message if very_verbose
     end
 
+    def to_output(string)
+      master ? master.logger.info(string) : puts(string)
+    end
+
     def update_status(string)
-      @master.update_status(string)
+      master ? master.update_status(string) : ($0 = string)
     end
 
   end
