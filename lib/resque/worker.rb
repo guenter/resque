@@ -162,10 +162,14 @@ module Resque
           # Wait until the child dies!
 
           begin
-            still_running = true
             loop do
-              # Check in with the master process during each iteration
-              still_running &= (!master || master.wants_me_alive?)
+              # Check in with the master process during each iteration but
+              # don't actually respond to a termination signal here. This is
+              # suboptimal. Ideally, we would become the job rather than fork,
+              # and set the process supervisor timeout to the maximum job
+              # length. We can simplify later. For now, the maximum job length
+              # timeout breaks this loop if the child hangs.
+              master && master.wants_me_alive?
 
               # If we receive a notifcation that one of our children has died,
               # then our work is done (for better or for worse).
@@ -189,6 +193,8 @@ module Resque
           # control loop started).
           rescue Errno::ECHILD, Errno::ESRCH
           end
+
+          # Report that we're done!
 
           done_working
           @child = nil
