@@ -35,8 +35,12 @@ namespace :resque do
     topdog_options = {
       :name => 'Resque',
       :num_workers => num_workers,
-      :leave_workers_running => true,
       :log_status => very_verbose,
+
+      # If the master process needs to go down, it will signal the workers to
+      # terminate but leave them running for at most :shutdown_timeout
+      # seconds. They will commit suicide once that interval has elapsed.
+      :leave_workers_running => true,
 
       # Set sensible, generous defaults
       :timeout => 2 * checkin_interval,
