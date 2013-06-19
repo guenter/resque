@@ -39,7 +39,7 @@ namespace :resque do
     checkin_interval = [interval, wait_sleep, 2].max
 
     topdog_options = {
-      :name => 'Resque',
+      :name => 'resque',
       :num_workers => num_workers,
       :log_status => very_verbose,
 
