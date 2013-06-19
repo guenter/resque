@@ -181,6 +181,10 @@ module Resque
               if limit && Time.now > limit
                 log_always "killed job (ran for #{Time.now - start_time}s)"
                 Process.kill(:KILL, @child)
+
+                # Mark the job as failed and notify redis for stats
+                job.fail(ExceededTimeout.new)
+                failed!
                 break
               end
 
