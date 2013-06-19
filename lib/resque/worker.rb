@@ -57,7 +57,7 @@ module Resque
     def self.find(worker_id)
       if exists? worker_id
         queues = worker_id.split(':')[-1].split(',')
-        worker = new(*queues)
+        worker = new(nil, :queues => queues)
         worker.to_s = worker_id
         worker
       else
@@ -87,8 +87,14 @@ module Resque
     # If passed a single "*", this Worker will operate on all queues
     # in alphabetical order. Queues can be dynamically added or
     # removed without needing to restart workers using this method.
-    def initialize(*queues)
-      @queues = queues.map { |queue| queue.to_s.strip }
+    def initialize(master, options={})
+      @master = master
+      @options = options
+
+      @queues = @options[:queues].map { |queue| queue.to_s.strip }
+      @interval = @options[:interval]
+      @maximum_task_time = @options[:maximum_task_time]
+
       validate_queues
     end
 
@@ -118,37 +124,54 @@ module Resque
     #
     # Also accepts a block which will be passed the job as soon as it
     # has completed processing. Useful for testing.
-    def work(interval = 5.0, &block)
-      interval = Float(interval)
-      $0 = "resque: Starting"
+    def work(&block)
+      update_status "resque: Starting"
       startup
 
-      loop do
-        break if shutdown?
+      while !@master || @master.wants_me_alive?
 
-        if not paused? and job = reserve
+        if (job = reserve)
           log "got: #{job.inspect}"
           run_hook :before_fork, job
           working_on job
 
-          if @child = fork
+          start_time = Time.now
+          limit = start_time + @maximum_task_time
+
+          @child = Kernel.fork do
             srand # Reseeding
-            procline "Forked #{@child} at #{Time.now.to_i}"
-            Process.wait
-          else
             procline "Processing #{job.queue} since #{Time.now.to_i}"
             perform(job, &block)
-            exit! unless @cant_fork
+            exit!
+          end
+
+          srand # Reseeding
+          procline "Forked #{@child} at #{Time.now.to_i}"
+
+          begin
+            loop do
+              pid = Process.wait(-1, Process::WNOHANG)
+              break if pid
+              if Time.now > limit
+                @master.logger.info "killed job (ran for #{Time.now - start_time}s)"
+                Process.kill(:KILL, @child)
+                break
+              end
+              sleep 0.1
+            end
+          rescue Errno::EINTR
+            retry
+          rescue Errno::ECHILD, Errno::ESRCH
           end
 
           done_working
           @child = nil
         else
-          break if interval.zero?
-          log! "Sleeping for #{interval} seconds"
-          procline paused? ? "Paused" : "Waiting for #{@queues.join(',')}"
-          sleep interval
+          log! "Sleeping for #{@interval} seconds"
+          procline "Waiting for #{@queues.join(',')}"
+          sleep @interval
         end
+
       end
 
     ensure
@@ -211,30 +234,9 @@ module Resque
       @queues[0] == "*" ? Resque.queues.sort : @queues
     end
 
-    # Not every platform supports fork. Here we do our magic to
-    # determine if yours does.
-    def fork
-      @cant_fork = true if $TESTING
-
-      return if @cant_fork
-
-      begin
-        # IronRuby doesn't support `Kernel.fork` yet
-        if Kernel.respond_to?(:fork)
-          Kernel.fork
-        else
-          raise NotImplementedError
-        end
-      rescue NotImplementedError
-        @cant_fork = true
-        nil
-      end
-    end
-
     # Runs all the methods needed when a worker begins its lifecycle.
     def startup
       enable_gc_optimizations
-      register_signal_handlers
       prune_dead_workers
       run_hook :before_first_fork
       register_worker
@@ -250,80 +252,6 @@ module Resque
       if GC.respond_to?(:copy_on_write_friendly=)
         GC.copy_on_write_friendly = true
       end
-    end
-
-    # Registers the various signal handlers a worker responds to.
-    #
-    # TERM: Shutdown immediately, stop processing jobs.
-    #  INT: Shutdown immediately, stop processing jobs.
-    # QUIT: Shutdown after the current job has finished processing.
-    # USR1: Kill the forked child immediately, continue processing jobs.
-    # USR2: Don't process any new jobs
-    # CONT: Start processing jobs again after a USR2
-    def register_signal_handlers
-      trap('TERM') { shutdown!  }
-      trap('INT')  { shutdown!  }
-
-      begin
-        trap('QUIT') { shutdown   }
-        trap('USR1') { kill_child }
-        trap('USR2') { pause_processing }
-        trap('CONT') { unpause_processing }
-      rescue ArgumentError
-        warn "Signals QUIT, USR1, USR2, and/or CONT not supported."
-      end
-
-      log! "Registered signals"
-    end
-
-    # Schedule this worker for shutdown. Will finish processing the
-    # current job.
-    def shutdown
-      log 'Exiting...'
-      @shutdown = true
-    end
-
-    # Kill the child and shutdown immediately.
-    def shutdown!
-      shutdown
-      kill_child
-    end
-
-    # Should this worker shutdown as soon as current job is finished?
-    def shutdown?
-      @shutdown
-    end
-
-    # Kills the forked child immediately, without remorse. The job it
-    # is processing will not be completed.
-    def kill_child
-      if @child
-        log! "Killing child at #{@child}"
-        if system("ps -o pid,state -p #{@child}")
-          Process.kill("KILL", @child) rescue nil
-        else
-          log! "Child #{@child} not found, restarting."
-          shutdown
-        end
-      end
-    end
-
-    # are we paused?
-    def paused?
-      @paused
-    end
-
-    # Stop processing jobs after the current one has completed (if we're
-    # currently running one).
-    def pause_processing
-      log "USR2 received; pausing job processing"
-      @paused = true
-    end
-
-    # Start processing jobs again after a pause
-    def unpause_processing
-      log "CONT received; resuming job processing"
-      @paused = false
     end
 
     # Looks for any workers which should be running on this server
@@ -521,17 +449,16 @@ module Resque
     # Procline is always in the format of:
     #   resque-VERSION: STRING
     def procline(string)
-      $0 = "resque-#{Resque::Version}: #{string}"
-      log! $0
+      update_status "resque-#{Resque::Version}: #{string}"
     end
 
     # Log a message to STDOUT if we are verbose or very_verbose.
     def log(message)
       if verbose
-        puts "*** #{message}"
+        @master.logger.info "*** #{message}"
       elsif very_verbose
         time = Time.now.strftime('%H:%M:%S %Y-%m-%d')
-        puts "** [#{time}] #$$: #{message}"
+        @master.logger.info "** [#{time}] #$$: #{message}"
       end
     end
 
@@ -539,5 +466,10 @@ module Resque
     def log!(message)
       log message if very_verbose
     end
+
+    def update_status(string)
+      @master.update_status(string)
+    end
+
   end
 end
