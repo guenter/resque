@@ -46,7 +46,7 @@ namespace :resque do
       # If the master process needs to go down, it will signal the workers to
       # terminate but leave them running for at most :shutdown_timeout
       # seconds. They will commit suicide once that interval has elapsed.
-      :leave_workers_running => true,
+      :synchonous_shutdown => false,
 
       # Set sensible, generous defaults
       :timeout => checkin_interval + buffer_time,
