@@ -34,8 +34,7 @@ namespace :resque do
 
     # This is how often a worker can be expected to check in. Within the outer
     # job dequeuing loop, the duration is on the order of interval, however, in
-    # the process wait loop, the duration is the wait_sleep. Also, choose a
-    # minimum of two seconds so that the master isn't constantly waking up.
+    # the process wait loop, the duration is the wait_sleep.
     checkin_interval = [interval, wait_sleep, 2].max
 
     topdog_options = {
@@ -50,13 +49,12 @@ namespace :resque do
 
       # Set sensible, generous defaults
       :timeout => checkin_interval + buffer_time,
-      :shutdown_timeout => maximum_task_time + buffer_time,
+      :shutdown_timeout => 10,
       :startup_timeout => 10
     }
 
     worker_options = {
       :queues => queues,
-
       :interval => interval,
       :maximum_task_time => maximum_task_time,
       :wait_sleep => wait_sleep,
@@ -83,6 +81,7 @@ namespace :resque do
 
     queues = (ENV['QUEUES'] || ENV['QUEUE']).to_s.split(',')
     interval = (ENV['INTERVAL'] || 5).to_f
+    maximum_task_time = ENV['MAX_TASK_TIME'].to_f if ENV['MAX_TASK_TIME']
 
     verbose = !!(ENV['LOGGING'] || ENV['VERBOSE'])
     very_verbose = !!ENV['VVERBOSE']
@@ -90,6 +89,7 @@ namespace :resque do
     worker_options = {
       :queues => queues,
       :interval => interval,
+      :maximum_task_time => maximum_task_time,
 
       :verbose => verbose,
       :very_verbose => very_verbose

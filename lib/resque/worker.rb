@@ -144,13 +144,12 @@ module Resque
           run_hook :before_fork, job
           working_on job
 
-          start_time = Time.now
-          limit = start_time + @maximum_task_time if @maximum_task_time
-
           # Fork the child process!
 
           @child = Kernel.fork do
             srand # Reseeding
+            untrap_signals
+            start_task_timer(job)
             procline "Processing #{job.queue} since #{Time.now.to_i}"
             perform(job, &block)
             exit!
@@ -162,39 +161,16 @@ module Resque
           # Wait until the child dies!
 
           begin
-            loop do
-              # Check in with the master process during each iteration but
-              # don't actually respond to a termination signal here. This is
-              # suboptimal. Ideally, we would become the job rather than fork,
-              # and set the process supervisor timeout to the maximum job
-              # length. We can simplify later. For now, the maximum job length
-              # timeout breaks this loop if the child hangs.
-              master && master.wants_me_alive?
-
-              # If we receive a notifcation that one of our children has died,
-              # then our work is done (for better or for worse).
-              pid = Process.wait(-1, Process::WNOHANG)
-              break if pid
-
-              # If the client specified a maximum time limit for the child
-              # process, then enforce it here by sending a kill signal.
-              if limit && Time.now > limit
-                log_always "killed job (ran for #{Time.now - start_time}s)"
-                Process.kill(:KILL, @child)
-
-                # Mark the job as failed and notify redis for stats
-                job.fail(ExceededTimeout.new)
-                failed!
-                break
-              end
-
+            while !master || master.wants_me_alive?
+              # Once we receive a notifcation that one of our children has died,
+              # then our work is done.
+              break if Process.wait(-1, Process::WNOHANG)
               sleep @wait_sleep
             end
           rescue Errno::EINTR
             retry
-          # These can be throw by Process.wait and Process.kill, they indicate
-          # to us that our child is no longer running (or died before the
-          # control loop started).
+          # These can be thrown by Process.wait, they indicate to us that our
+          # child is no longer running (or died before the loop started).
           rescue Errno::ECHILD, Errno::ESRCH
           end
 
@@ -207,7 +183,6 @@ module Resque
           procline "Waiting for #{@queues.join(',')}"
           sleep @interval
         end
-
       end
 
     ensure
@@ -243,6 +218,25 @@ module Resque
       ensure
         yield job if block_given?
       end
+    end
+
+    # Runs within the child process, forces termination when the maximum
+    # job length is exceeded.
+    def start_task_timer(job)
+      return unless @maximum_task_time
+      start_time = Time.now
+      Thread.new do
+        sleep @maximum_task_time
+        # Mark the job as failed and notify redis for stats
+        log_always "killed job (ran for #{Time.now - start_time}s)"
+        job.fail(ExceededTimeout.new)
+        failed!
+        exit!
+      end
+    end
+
+    def untrap_signals
+      master.untrap_signals if master
     end
 
     # Attempts to grab a job off one of the provided queues. Returns
