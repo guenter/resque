@@ -137,7 +137,7 @@ module Resque
       # support the transitional case in which we want to preserve the
       # behavior of resque without a process supervisor.
 
-      while !master || master.wants_me_alive?
+      until wants_down?
 
         if (job = reserve)
           log "got: #{job.inspect}"
@@ -164,7 +164,7 @@ module Resque
           # Wait until the child dies (or the timeout is exceeded)!
 
           begin
-            while !master || master.wants_me_alive?
+            until wants_down?
               # Once we receive notifcation that one of our children has died,
               # our work is done. Move on to the next task.
               break if Process.wait(-1, Process::WNOHANG)
@@ -210,6 +210,10 @@ module Resque
 
     ensure
       unregister_worker
+    end
+
+    def wants_down?
+      shutdown? || (master && !master.wants_me_alive?)
     end
 
     # DEPRECATED. Processes a single job. If none is given, it will
@@ -290,6 +294,9 @@ module Resque
     # Runs all the methods needed when a worker begins its lifecycle.
     def startup
       enable_gc_optimizations
+      # If we're being supervised, the master informs us of our termination
+      # through a different mechanism.
+      register_signal_handlers unless master
       prune_dead_workers
       run_hook :before_first_fork
       register_worker
@@ -305,6 +312,43 @@ module Resque
       if GC.respond_to?(:copy_on_write_friendly=)
         GC.copy_on_write_friendly = true
       end
+    end
+
+    # Registers the various signal handlers a worker responds to.
+    # TERM: Shutdown immediately, stop processing jobs.
+    #  INT: Shutdown immediately, stop processing jobs.
+    # QUIT: Shutdown after the current job has finished processing.
+    def register_signal_handlers
+      trap('TERM') { shutdown! }
+      trap('INT')  { shutdown! }
+      trap('QUIT') { shutdown  }
+
+      log! "Registered signals"
+    end
+
+    # Schedule this worker for shutdown. Will finish processing the
+    # current job.
+    def shutdown
+      log 'Exiting...'
+      @shutdown = true
+    end
+
+    # Kill the child and shutdown immediately.
+    def shutdown!
+      shutdown
+      kill_child
+    end
+
+    # Should this worker shutdown as soon as current job is finished?
+    def shutdown?
+      @shutdown
+    end
+
+    # Kills the forked child immediately, without remorse. The job it
+    # is processing will not be completed.
+    def kill_child
+      Process.kill("KILL", @child) if @child
+    rescue Errno::ESRCH
     end
 
     # Looks for any workers which should be running on this server
