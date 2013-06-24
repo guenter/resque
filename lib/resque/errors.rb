@@ -7,4 +7,7 @@ module Resque
 
   # Raised when a worker was killed while processing a job.
   class DirtyExit < RuntimeError; end
+
+  # Raised when a job exceeds the maximum length for processing.
+  class ExceededTimeout < RuntimeError; end
 end
