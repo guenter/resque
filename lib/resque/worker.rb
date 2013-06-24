@@ -144,6 +144,9 @@ module Resque
           run_hook :before_fork, job
           working_on job
 
+          start_time = Time.now
+          limit = start_time + @maximum_task_time if @maximum_task_time
+
           # Fork the child process!
 
           @child = Kernel.fork do
@@ -158,13 +161,33 @@ module Resque
           srand # Reseeding
           procline "Forked #{@child} at #{Time.now.to_i}"
 
-          # Wait until the child dies!
+          # Wait until the child dies (or the timeout is exceeded)!
 
           begin
             while !master || master.wants_me_alive?
-              # Once we receive a notifcation that one of our children has died,
-              # then our work is done.
+              # Once we receive notifcation that one of our children has died,
+              # our work is done. Move on to the next task.
               break if Process.wait(-1, Process::WNOHANG)
+
+              # If the client specified a maximum time limit for tasks, enforce
+              # it here by sending the kill signal. Even though this case should
+              # be covered by child auto-termination, we give the worker another
+              # way out as an affordance against the possibilty of perpetually
+              # waiting for its child to terminate.
+              if limit && Time.now > limit
+                log_always "killed job (ran for #{Time.now - start_time}s)"
+
+                begin
+                  Process.kill(:KILL, @child)
+                rescue Errno::ESRCH
+                end
+                # Mark the job as failed and notify redis for stats
+                job.fail(ExceededTimeout.new)
+                failed!
+                break
+              end
+
+              # Sleep between polls
               sleep @wait_sleep
             end
           rescue Errno::EINTR
